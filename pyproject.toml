@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "style-salad"
+version = "0.1.0"
+description = "Style-SALAD text-driven stylized human motion generation."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+]
+dependencies = [
+    "colorcet",
+    "diffusers",
+    "einops",
+    "matplotlib",
+    "numpy<2",
+    "PyYAML",
+    "rich",
+    "scikit-learn",
+    "scipy",
+    "tensorboard",
+    "torchmetrics",
+    "tqdm",
+    "transformers",
+]
+
+[project.scripts]
+style-salad-train = "style_salad.training.train:main"
+style-salad-generate = "style_salad.cli.generate:main"
+style-salad-evaluate = "style_salad.evaluation.evaluate:main"
+
+[tool.setuptools.packages.find]
+where = ["src", "."]
+include = ["style_salad*", "salad*", "mld*"]

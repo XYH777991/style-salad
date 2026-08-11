@@ -1,0 +1,483 @@
+import argparse
+import csv
+import os
+from os.path import join as pjoin
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+
+import numpy as np
+import yaml
+import time
+import random
+from tqdm import tqdm
+
+from style_salad.evaluation.dataset import Text2MotionTestDataset
+from style_salad.evaluation.metrics import TM2TMetrics
+from style_salad.evaluation.evaluator_wrapper import StyleClassification
+
+from style_salad.models.t2sm import Text2StylizedMotion
+
+from salad.models.t2m_eval_wrapper import build_evaluators
+from salad.utils.word_vectorizer import WordVectorizer
+
+
+def build_dict_from_txt(filename):
+    """
+    Build a mapping from style label index -> style name (or motion name).
+
+    The text file is assumed to have at least 3 space-separated columns per line,
+    e.g. something like:
+        0  Angry_angry  0
+        1  Happy_happy  1
+    This function:
+      - uses the 3rd column (parts[2]) as the key (label index, as a string),
+      - uses the 2nd column (parts[1]) split at '_' and takes the first part as the value.
+    So you'll end up with a dict like:
+      { "0": "Angry", "1": "Happy", ... }
+    """
+    result_dict = {}
+    
+    with open(filename, 'r') as f:
+        for line in f:
+            parts = line.strip().split(" ")
+            if len(parts) >= 3:
+                key = parts[2]
+                value = parts[1].split("_")[0]
+                result_dict[key] = value
+                
+    return result_dict
+
+
+# Padding to max length in one batch
+def collate_tensors(batch):
+    """
+    Given a list of tensors with possibly different lengths in some dimensions,
+    pad them into a single tensor by zero-filling up to the maximum size in each dim.
+
+    Args:
+        batch: list[Tensor], each having the same number of dimensions but possibly
+               different sizes along each dimension.
+
+    Returns:
+        canvas: Tensor of shape (B, max_dim0, max_dim1, ...) where each original
+                tensor is placed in the "top-left" corner and the rest is zero.
+    """
+    dims = batch[0].dim()
+    # Compute max size in each dimension across the batch
+    max_size = [max([b.size(i) for b in batch]) for i in range(dims)]
+    size = (len(batch), ) + tuple(max_size)
+    canvas = batch[0].new_zeros(size=size)
+    for i, b in enumerate(batch):
+        sub_tensor = canvas[i]
+        # Narrow successively along each dimension to match b's shape
+        for d in range(dims):
+            sub_tensor = sub_tensor.narrow(d, 0, b.size(d))
+        # Add b into the narrowed view (i.e., write b into the padded canvas)
+        sub_tensor.add_(b)
+    return canvas
+
+
+def collate_fn(batch):
+    """
+    Custom collate function for Text2MotionTestDataset.
+
+    The dataset is assumed to return a tuple/list with (indices are inferred from usage):
+        b[0]  = word_embs (L, 300)
+        b[1]  = pos_ohot (L, 15)
+        b[2]  = caption (str, text for content)
+        b[3]  = sent_len (int)
+        b[4]  = motion (T, D)  -- content motion (HumanML)
+        b[5]  = m_length (int) -- length of content motion
+        b[6]  = tokens (str or list of tokens)
+        b[7]  = caption2 (style text / second caption)
+        b[8]  = reference_motion (T2, D) -- style reference motion (100STYLE)
+        b[9]  = sent_len2 (int) -- text length for caption2
+        b[10] = label (int)     -- style label index
+        b[11] = style_text (str, e.g. the style name)
+
+    We:
+      - filter out any None entries
+      - sort the batch by text length (b[3]) in descending order (needed by some RNN encoders)
+      - pad variable-length tensors to the max size using collate_tensors
+      - pack into a dict that t2m_eval expects.
+    """
+    notnone_batches = [b for b in batch if b is not None]
+    # Sort by text length (b[3]) descending
+    notnone_batches.sort(key=lambda x: x[3], reverse=True)
+
+    adapted_batch = {
+        # Content motion (HumanML), padded
+        "motion":
+        collate_tensors([torch.tensor(b[4]).float() for b in notnone_batches]),
+
+        # Original caption strings
+        "text": [b[2] for b in notnone_batches],
+
+        # Motion lengths as a Python list (later converted to tensor in t2m_eval)
+        "length": [b[5] for b in notnone_batches],
+
+        # Text features from t2m evaluator
+        "word_embs":
+        collate_tensors([torch.tensor(b[0]).float() for b in notnone_batches]),
+        "pos_ohot":
+        collate_tensors([torch.tensor(b[1]).float() for b in notnone_batches]),
+        "text_len":
+        collate_tensors([torch.tensor(b[3]) for b in notnone_batches]),
+        "tokens": [b[6] for b in notnone_batches],
+
+        # Style-reference motion and text
+        "reference_motion": collate_tensors([torch.tensor(b[8]).float() for b in notnone_batches]),
+        "text2": [b[7] for b in notnone_batches],
+        "style_text": [b[11] for b in notnone_batches],
+
+        # Style labels & lengths for the second text
+        "label": [torch.tensor(int(b[10])) for b in notnone_batches],
+        "text_len2":collate_tensors([torch.tensor(b[9]) for b in notnone_batches]),
+        "length2": [b[9] for b in notnone_batches],
+    }
+    return adapted_batch
+
+class SmoodiEval():
+    """
+    Wrapper that:
+      - Loads a trained Text2StylizedMotion model
+      - Prepares evaluation datasets & dataloaders
+      - Runs stylization on reference motions given text
+      - Computes:
+          * style recognition metrics (via StyleClassification)
+          * text-motion alignment metrics (via SALAD t2m evaluators + TM2TMetrics)
+    """
+    def __init__(self, config, device=None):
+
+        self.config = config
+        self.device = torch.device(device or ("cuda:0" if torch.cuda.is_available() else "cpu"))
+        classifier_path = config.get(
+            "style_classifier_path",
+            "./checkpoints/style_classifier/style_classifier.pt",
+        )
+        classifier_nclasses = int(config.get("style_classifier_nclasses", 47))
+        style_name_dict_path = config.get(
+            "style_name_dict_path",
+            "./dataset/100style/100STYLE_name_dict_Filter.txt",
+        )
+        
+        # model
+        self.model = Text2StylizedMotion(config["model"]).to(self.device)
+        ckpt_path = config.get("checkpoint_path")
+        if ckpt_path is None:
+            ckpt_path = pjoin(config["checkpoint_dir"], config.get("checkpoint_name", "latest.ckpt"))
+        if not os.path.isfile(ckpt_path):
+            raise FileNotFoundError(f"Missing Style-SALAD checkpoint: {ckpt_path}")
+        self.model.load_state_dict(
+            torch.load(ckpt_path, map_location=self.device, weights_only=True), strict=False
+        )
+        self.model.eval()
+        for p in self.model.parameters():
+            p.requires_grad = False
+
+        # style classifier
+        self.classifier = StyleClassification(nclasses=classifier_nclasses).to(self.device)
+        self.classifier.load_state_dict(
+            torch.load(classifier_path, map_location=self.device, weights_only=True)
+        )
+        self.label_to_motion = build_dict_from_txt(style_name_dict_path)
+
+        # metrics
+        self.metrics = TM2TMetrics().to(self.device)
+
+        # evaluation models
+        self.text_enc, self.motion_enc, self.movement_enc = build_evaluators({
+            "dataset_name": "t2m",
+            "device": self.device,
+            "dim_word": 300,
+            "dim_pos_ohot": 15,
+            "dim_motion_hidden": 1024,
+            "dim_text_hidden": 512,
+            "dim_coemb_hidden": 512,
+            "dim_pose": 263,
+            "dim_movement_enc_hidden": 512,
+            "dim_movement_latent": 512,
+            "checkpoints_dir": config.get("t2m_evaluator_checkpoint_dir", "./checkpoints"),
+            "unit_length": 4,
+        })
+        self.text_enc = self.text_enc.to(self.device)
+        self.motion_enc = self.motion_enc.to(self.device)
+        self.movement_enc = self.movement_enc.to(self.device)
+        self.text_enc.eval()
+        self.motion_enc.eval()
+        self.movement_enc.eval()
+        for p in self.text_enc.parameters():
+            p.requires_grad = False
+        for p in self.motion_enc.parameters():
+            p.requires_grad = False
+        for p in self.movement_enc.parameters():
+            p.requires_grad = False
+
+        # dataset & dataloader
+        mean = np.load(config.get("style_mean_path", "./dataset/100style/Mean.npy"))
+        std = np.load(config.get("style_std_path", "./dataset/100style/Std.npy"))
+        mean_eval = np.load(config.get("eval_mean_path", "./checkpoints/t2m/Comp_v6_KLD01/meta/mean.npy"))
+        std_eval = np.load(config.get("eval_std_path", "./checkpoints/t2m/Comp_v6_KLD01/meta/std.npy"))
+        w_vectorizer = WordVectorizer(config.get("glove_dir", "./glove"), config.get("glove_vocab", "our_vab"))
+        dataset = Text2MotionTestDataset(
+            mean=mean,
+            std=std,
+            mean_eval=mean_eval,
+            std_eval=std_eval,
+            w_vectorizer=w_vectorizer,
+            max_motion_length=196,
+            min_motion_length=40,
+            max_text_len=20,
+            unit_length=4,
+            motion_dir1=config.get("humanml_motion_dir", "./dataset/humanml3d/new_joint_vecs"),
+            text_dir1=config.get("humanml_text_dir", "./dataset/humanml3d/texts"),
+            motion_dir2=config.get("style_motion_dir", "./dataset/100style/new_joint_vecs"),
+            text_dir2=config.get("style_text_dir", "./dataset/100style/texts"),
+            style_name_dict_path=style_name_dict_path,
+            humanml_split_file=config.get("eval_humanml_split_file", "./dataset/100style/test_humanml.txt"),
+            style_split_file=config.get("eval_style_split_file", "./dataset/100style/test_100STYLE_Filter.txt"),
+        )
+        self.data_loader = DataLoader(
+            dataset,
+            batch_size=32,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=self.device.type == "cuda",
+            drop_last=True,
+            collate_fn=collate_fn,
+        )
+
+    def t2m_eval(self, batch):
+        texts = batch["text"]
+        motions = batch["motion"].detach().clone().to(self.device)
+        lengths = torch.as_tensor(batch["length"], device=self.device)
+        reference_motion = batch["reference_motion"].detach().clone().to(self.device)
+        lengths2 = torch.as_tensor(batch["length2"], device=self.device)
+        label = torch.stack(batch["label"]).to(self.device)
+
+        word_embs = batch["word_embs"].detach().clone().to(self.device)
+        pos_ohot = batch["pos_ohot"].detach().clone().to(self.device)
+        text_lengths = batch["text_len"].detach().clone().to(self.device)
+
+        ref_t2m = self.data_loader.dataset.renorm4t2m(reference_motion)
+        start = time.time()
+        guidance = None
+        if self.config.get("model", {}).get("recompute_v_guided", False):
+            guidance = {"recompute_v_guided": True}
+        feats_rst_t2m = self.model.generate(ref_t2m, texts, lengths, lengths2, guidance=guidance)[0]
+        end = time.time()
+
+        feats_rst = self.data_loader.dataset.renorm4style(feats_rst_t2m)
+        logits = self.classifier(feats_rst)
+        probs = F.softmax(logits, dim=-1)
+        predicted = torch.argmax(probs, dim=1)
+
+        motion_name = self.label_to_motion[str(predicted[0].cpu().numpy())]
+        base_name = self.label_to_motion[str(label[0].cpu().numpy())]
+        print(f"Name: {base_name} -> {motion_name}")
+
+
+        joints_rst = self.data_loader.dataset.feats2joints(feats_rst)
+
+        # renorm for t2m eval
+        feats_rst = self.data_loader.dataset.renorm4t2m(feats_rst)
+        motions = self.data_loader.dataset.renorm4t2m(motions)
+
+        # t2m motion encoder
+        align_idx = np.argsort(lengths.data.tolist())[::-1].copy()
+        motions = motions[align_idx]
+        feats_rst = feats_rst[align_idx]
+        lengths = lengths[align_idx]
+        lengths = torch.div(lengths, 4, rounding_mode="floor")
+
+        recons_mov = self.movement_enc(feats_rst[..., :-4]).detach()
+        recons_emb = self.motion_enc(recons_mov, lengths)
+        motion_mov = self.movement_enc(motions[..., :-4]).detach()
+        motion_emb = self.motion_enc(motion_mov, lengths)
+        text_emb = self.text_enc(word_embs, pos_ohot, text_lengths)[align_idx]
+
+        lat_t   = text_emb.detach().cpu()
+        lat_m   = motion_emb.detach().cpu()
+        lat_rm  = recons_emb.detach().cpu()
+        joints_rst_cpu = joints_rst.detach().cpu()
+        logits_cpu     = logits.detach().cpu()
+        label_cpu      = label.detach().cpu()
+        lengths_cpu    = lengths.detach().cpu()
+
+        return {
+            "lat_t": lat_t,
+            "lat_m": lat_m,
+            "lat_rm": lat_rm,
+            "joints_rst": joints_rst_cpu,
+            "predicted": logits_cpu,
+            "label": label_cpu,
+            "inference_time": end - start,
+            "length": lengths_cpu,
+        }
+
+    def evaluate(self):
+        for i, batch in enumerate(tqdm(self.data_loader, desc="Evaluating")):
+            res = self.t2m_eval(batch)
+            self.metrics.update(
+                res["lat_t"],
+                res["lat_rm"],
+                res["lat_m"],
+                res["length"],
+                res["predicted"],
+                res["label"],
+                res["joints_rst"],
+                res["inference_time"],
+            )
+
+            del res
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+
+            if i % 10 == 0 and i > 0:
+                print(f"Batch {i}:")
+                self.compute_metrics()
+
+    def compute_metrics(self):
+        metrics_dict = self.metrics.compute()
+        print(metrics_dict)
+        for k, v in metrics_dict.items():
+            if isinstance(v, float):
+                print(f"{k}: {v}")
+            elif isinstance(v, torch.Tensor):
+                print(f"{k}: {v.item()}")
+            elif isinstance(v, np.ndarray):
+                print(f"{k}: {v.item()}")
+        return metrics_dict
+
+
+def load_config():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, required=True, help='Path to config file (YAML)')
+    parser.add_argument('--style_weight', type=float, default=None,
+                        help='Override config.model.style_weight at runtime')
+    parser.add_argument('--style_guidance', type=float, default=None,
+                        help='Override config.model.style_guidance at runtime')
+    parser.add_argument('--csv_name', type=str, default=None,
+                        help='CSV filename to write results to (e.g., metrics_style0.5.csv)')
+    parser.add_argument('--style_classifier_path', type=str, default=None,
+                        help='Override the style classifier checkpoint used for evaluation')
+    parser.add_argument('--checkpoint', type=str, default=None,
+                        help='Checkpoint filename under config checkpoint_dir')
+    parser.add_argument('--checkpoint_path', type=str, default=None,
+                        help='Exact checkpoint path; overrides --checkpoint')
+    parser.add_argument('--style_classifier_nclasses', type=int, default=None,
+                        help='Override the number of output classes in the style classifier')
+    parser.add_argument('--style_name_dict_path', type=str, default=None,
+                        help='Override the style label-to-name dictionary used for evaluation')
+    parser.add_argument('--recompute_guided_v_pred', action='store_true',
+                        help='Recompute v_pred from the guided latent before each DDIM step during generation')
+    args = parser.parse_args()
+
+    from pathlib import Path
+    cfg_path = Path(args.config).resolve()
+
+    with cfg_path.open('r') as f:
+        config = yaml.safe_load(f)
+
+    parts = cfg_path.parts
+    if "configs" in parts:
+        i = parts.index("configs")
+        sub = Path(*parts[i+1:]).with_suffix("")
+        run_name = str(sub).replace("\\", "/")
+    else:
+        run_name = cfg_path.stem
+
+    config["run_name"]       = run_name
+    config["result_dir"]     = os.path.join(config["result_dir"], run_name)
+    config["checkpoint_dir"] = os.path.join(config["checkpoint_dir"], run_name)
+
+    if args.style_weight is not None:
+        if "model" not in config or not isinstance(config["model"], dict):
+            config["model"] = {}
+        config["model"]["style_weight"] = args.style_weight
+
+    if args.style_guidance is not None:
+        if "model" not in config or not isinstance(config["model"], dict):
+            config["model"] = {}
+        config["model"]["style_guidance"] = args.style_guidance
+
+    if args.recompute_guided_v_pred:
+        if "model" not in config or not isinstance(config["model"], dict):
+            config["model"] = {}
+        config["model"]["recompute_v_guided"] = True
+
+    if args.csv_name is not None:
+        config["csv_name"] = args.csv_name
+
+    if args.style_classifier_path is not None:
+        config["style_classifier_path"] = args.style_classifier_path
+
+    if args.checkpoint is not None:
+        config["checkpoint_name"] = args.checkpoint
+
+    if args.checkpoint_path is not None:
+        config["checkpoint_path"] = args.checkpoint_path
+
+    if args.style_classifier_nclasses is not None:
+        config["style_classifier_nclasses"] = args.style_classifier_nclasses
+
+    if args.style_name_dict_path is not None:
+        config["style_name_dict_path"] = args.style_name_dict_path
+
+    return config
+
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def main():
+    config = load_config()
+
+    set_seed(config["random_seed"])
+    evaluator = SmoodiEval(config)
+    evaluator.evaluate()
+    metrics = evaluator.compute_metrics()
+
+    style_weight = None
+    style_guidance = None
+    if "model" in config and isinstance(config["model"], dict):
+        style_weight   = config["model"].get("style_weight", None)
+        style_guidance = config["model"].get("style_guidance", None)
+
+    row = {
+        "run": config["run_name"],
+        "style_weight": style_weight,
+        "style_guidance": style_guidance,
+    }
+
+    for k, v in metrics.items():
+        if isinstance(v, torch.Tensor):
+            v = v.item()
+        elif isinstance(v, np.ndarray):
+            v = float(v)
+        row[k] = v
+
+    csv_dir  = config.get("evaluation_dir", "./artifacts/evaluation")
+    csv_name = config.get("csv_name", "metrics.csv")
+    csv_file = os.path.join(csv_dir, csv_name)
+    os.makedirs(csv_dir, exist_ok=True)
+    exists = os.path.isfile(csv_file)
+
+    fieldnames = ["run", "style_weight", "style_guidance"] + list(metrics.keys())
+
+    with open(csv_file, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+if __name__ == "__main__":
+    main()

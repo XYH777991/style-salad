@@ -1,0 +1,14 @@
+# Install the PyTorch build that matches your CUDA/runtime separately.
+colorcet
+diffusers
+einops
+matplotlib
+numpy<2
+PyYAML
+rich
+scikit-learn
+scipy
+tensorboard
+torchmetrics
+tqdm
+transformers

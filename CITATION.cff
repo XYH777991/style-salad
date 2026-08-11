@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "If you use Style-SALAD, please cite the paper."
+title: "Stylized Text-to-Motion Generation via Hypernetwork-Driven Low-Rank Adaptation"
+authors:
+  - family-names: Jeon
+    given-names: Junhyuk
+  - family-names: Hong
+    given-names: Seokhyeon
+  - family-names: Noh
+    given-names: Junyong
+date-released: 2026-08-11
+url: "https://junhyukjeon.github.io/projects/style-salad/"
+repository-code: "https://github.com/junhyukjeon/style-salad"
+license: MIT

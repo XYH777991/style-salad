@@ -1,0 +1,329 @@
+import json
+import numpy as np
+import os
+import random
+import torch
+from torch.utils.data import Dataset
+from tqdm import tqdm
+
+
+class Dataset100STYLE(Dataset):
+    def __init__(self, config):
+        self.motion_dir  = config["motion_dir"]
+        self.mean        = np.load(config["mean_path"])
+        self.std         = np.load(config["std_path"])
+        self.unit_length = int(config["unit_length"])
+        self.min_frames  = int(config["min_frames"])
+        self.max_frames  = int(config["max_frames"])
+
+        self.drop_first_frame = bool(config.get("drop_first_frame", False))
+        self.unit_double_prob = float(config.get("unit_double_prob", 0.0))
+        self.motion_cache = {}
+
+        # Style mapping. Raw style names can be split or remapped for existing mirrored files.
+        with open(config["style_json"], "r") as f:
+            style_map_all = json.load(f)
+        all_styles = sorted(style_map_all.keys())
+        excluded_styles = set(config.get("excluded_styles", []))
+        selected_styles = [s for s in all_styles if s not in excluded_styles]
+        self.raw_style_map = {s: style_map_all[s] for s in selected_styles}
+
+        # Content mapping (for filtering and captions)
+        with open(config["content_json"], "r") as f:
+            content_map = json.load(f)  # {content_key: [motion_ids]}
+        contents_sorted = sorted(content_map.keys())
+        self.content_to_idx = {c: i for i, c in enumerate(contents_sorted)}
+        self.idx_to_content = {i: c for c, i in self.content_to_idx.items()}
+
+        self.motion_to_content_idx = {}
+        for content_key, mids in content_map.items():
+            cidx = self.content_to_idx[content_key]
+            for mid in mids:
+                self.motion_to_content_idx[mid] = cidx
+
+        # Content captions
+        self.content_prompts = {
+            "BR": "a person is running backward",
+            "BW": "a person is walking backward",
+            "FR": "a person is running forward",
+            "FW": "a person is walking forward",
+            "ID": "a person is standing still",
+            "SR": "a person is running sideways",
+            "SW": "a person is walking sideways",
+        }
+
+        # Content filtering
+        exclude_keys = set(config.get("excluded_content_keys", ["TR1", "TR2", "TR3"]))
+        self.exclude_content_idxs = {
+            self.content_to_idx[k]
+            for k in exclude_keys if k in self.content_to_idx
+        }
+
+        self.split_style_by_content = config.get("split_style_by_content", {})
+        self.mirror_style_map = self._build_mirror_style_map(config.get("mirror_style_pairs", []))
+        mirrored_prefixes = config.get("mirrored_motion_prefixes", ["M"])
+        if isinstance(mirrored_prefixes, str):
+            mirrored_prefixes = [mirrored_prefixes]
+        self.mirrored_motion_prefixes = tuple(mirrored_prefixes)
+
+        label_names = set()
+        for style_name in selected_styles:
+            split_cfg = self.split_style_by_content.get(style_name)
+            if split_cfg:
+                label_names.update(split_cfg.values())
+            else:
+                label_names.add(style_name)
+        self.style_to_idx = {s: i for i, s in enumerate(sorted(label_names))}
+        self.idx_to_style = {i: s for s, i in self.style_to_idx.items()}
+
+        # Index valid samples
+        self.items = []
+        self.nfeats = None
+        kept = mirrored = miss = short = outlier = filtered = 0
+
+        for style_name, motion_ids in self.raw_style_map.items():
+            iterable = tqdm(motion_ids, desc=f"Index 100STYLE style={style_name}", leave=False)
+
+            for motion_id in iterable:
+                path = os.path.join(self.motion_dir, f"{motion_id}.npy")
+                if not os.path.exists(path):
+                    miss += 1
+                    continue
+
+                arr = np.load(path, mmap_mode="r")
+                T = int(arr.shape[0])
+
+                if self.drop_first_frame and T > 1:
+                    arr = arr[1:]
+                    T -= 1
+
+                if T < self.min_frames:
+                    short += 1
+                    continue
+
+                if np.max(np.abs((arr - self.mean) / self.std)) > 1e3:
+                    outlier += 1
+                    continue
+
+                cidx = self.motion_to_content_idx.get(motion_id, None)
+                if cidx is None or cidx in self.exclude_content_idxs:
+                    filtered += 1
+                    continue
+                content_key = self.idx_to_content[cidx]
+
+                if self.nfeats is None:
+                    self.nfeats = int(arr.shape[1])
+
+                # Cache a normalized float32 tensor once during indexing so
+                # __getitem__ only needs to slice and pad random windows.
+                motion = np.asarray((arr - self.mean) / self.std, dtype=np.float32)
+                self.motion_cache[motion_id] = torch.from_numpy(motion.copy())
+
+                is_mirrored = motion_id.startswith(self.mirrored_motion_prefixes)
+                label_style_name = self.mirror_style_map.get(style_name, style_name) if is_mirrored else style_name
+                style_label = self._resolve_style_label(label_style_name, content_key)
+                style_idx = self.style_to_idx[style_label]
+
+                self.items.append({
+                    "motion_id": motion_id,
+                    "source_motion_id": motion_id,
+                    "style_name": style_label,
+                    "raw_style_name": style_name,
+                    "label_style_name": label_style_name,
+                    "style_idx": style_idx,
+                    "content_idx": cidx,
+                    "length": T,
+                    "mirrored": is_mirrored,
+                })
+                kept += 1
+                if is_mirrored:
+                    mirrored += 1
+
+                if kept % 200 == 0:
+                    iterable.set_postfix(
+                        kept=kept, mir=mirrored, miss=miss, short=short, outlier=outlier, filt=filtered
+                    )
+
+        self.items.sort(key=lambda x: x["length"])
+        print(
+            f"[100STYLE] kept={kept} mirrored={mirrored} miss={miss} "
+            f"short={short} outlier={outlier} filtered={filtered} labels={len(self.style_to_idx)}"
+        )
+        print(f"[100STYLE] cached {len(self.motion_cache)} motions in RAM")
+
+    @staticmethod
+    def _build_mirror_style_map(pairs):
+        mapping = {}
+        for pair in pairs:
+            if len(pair) != 2:
+                raise ValueError(f"Mirror style pairs must contain exactly two style names, got: {pair}")
+            left, right = pair
+            mapping[left] = right
+            mapping[right] = left
+        return mapping
+
+    def _resolve_style_label(self, style_name, content_key):
+        split_cfg = self.split_style_by_content.get(style_name)
+        if not split_cfg:
+            return style_name
+        if content_key not in split_cfg:
+            raise ValueError(
+                f"No split label configured for style='{style_name}', content='{content_key}'."
+            )
+        return split_cfg[content_key]
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx: int):
+        meta = self.items[idx]
+        motion = self.motion_cache[meta["motion_id"]]
+        T, D = int(motion.shape[0]), int(motion.shape[1])
+
+        U = self.unit_length
+        if U <= 0:
+            m_length = T
+        else:
+            k = max(1, T // U)
+            m_length = k * U
+            if U < 10 and self.unit_double_prob > 0.0 and k > 1:
+                if random.random() < self.unit_double_prob:
+                    m_length = (k - 1) * U
+
+        if self.max_frames is not None:
+            m_length = min(m_length, self.max_frames)
+        m_length = max(1, min(m_length, T))
+
+        # Random crop
+        start_max = max(0, T - m_length)
+        s = 0 if start_max == 0 else random.randint(0, start_max)
+        clip = motion[s:s + m_length]
+
+        window = clip
+
+        # Right padding
+        if self.max_frames is not None and m_length < self.max_frames:
+            pad = torch.zeros(self.max_frames - m_length, D, dtype=window.dtype)
+            window = torch.cat([window, pad], dim=0)
+
+        content_key = self.idx_to_content[meta["content_idx"]]
+        caption = self.content_prompts[content_key]
+        return caption, window, int(m_length), int(meta["style_idx"])
+
+
+class DatasetHumanML3D(Dataset):
+    def __init__(self, config, train=True):
+        self.train       = bool(train)
+        self.mean        = np.load(config["mean_path"])
+        self.std         = np.load(config["std_path"])
+        self.unit_length = int(config["unit_length"])
+        self.min_frames  = int(config["min_frames"])
+        self.max_frames  = int(config["max_frames"]) if config["max_frames"] is not None else None
+
+        if train:
+            split_base = config["split_base_train"]
+        else:
+            split_base = config["split_base_valid"]
+        split_dir  = os.path.dirname(split_base)
+        split_name = os.path.basename(split_base).split(".")[0]
+        ids_file   = os.path.join(split_dir, f"{split_name}.txt")
+        self.motion_dir = os.path.join(split_dir, "new_joint_vecs")
+        self.text_dir   = os.path.join(split_dir, "texts")
+
+        if not os.path.exists(ids_file):
+            raise FileNotFoundError(f"Missing ID list: {ids_file}")
+
+        # Load IDs
+        with open(ids_file, "r", encoding="utf-8") as f:
+            self.id_list = [ln.strip() for ln in f if ln.strip()]
+
+        # Index
+        miss = short = kept = long = 0
+        self.items = []
+
+        iterable = tqdm(self.id_list, desc=f"Index HumanML3D ({'train' if self.train else 'valid'})", leave=False)
+        for motion_id in iterable:
+            path = os.path.join(self.motion_dir, f"{motion_id}.npy")
+            if not os.path.exists(path):
+                miss += 1
+                continue
+
+            arr = np.load(path, mmap_mode="r")
+            T = int(arr.shape[0])
+            if T < self.min_frames:
+                short += 1
+                continue
+
+            if T >= 200:
+                long += 1
+                continue
+
+            self.items.append({"motion_id": motion_id, "length": T})
+            kept += 1
+
+            if kept % 500 == 0:
+                iterable.set_postfix(kept=kept, miss=miss, short=short, long=long)
+
+        self.items.sort(key=lambda x: x["length"])
+        if not self.items:
+            raise RuntimeError("No HumanML3D items found after filtering.")
+        print(f"[HumanML3D] kept={kept} miss={miss} short={short} long={long}")
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx: int):
+        meta   = self.items[idx]
+        motion = np.load(os.path.join(self.motion_dir, f"{meta['motion_id']}.npy"), mmap_mode="r")
+        T, D   = int(motion.shape[0]), int(motion.shape[1])
+
+        # Unit rounding
+        U = self.unit_length
+        if U <= 0:
+            m_length = T
+        else:
+            k = max(1, T // U)
+            m_length = k * U
+        if self.max_frames is not None:
+            m_length = min(m_length, self.max_frames)
+        m_length = max(1, min(m_length, T))
+
+        # Start index (random for train, center for eval)
+        if self.train:
+            start_max = max(0, T - m_length)
+            s = 0 if start_max == 0 else random.randint(0, start_max)
+        else:
+            s = max(0, (T - m_length) // 2)
+
+        clip = motion[s:s + m_length]
+
+        # Z-normalize and tensor-ify
+        window = (clip - self.mean) / self.std
+        window = torch.tensor(window, dtype=torch.float32)
+
+        # Right-pad to max_frames
+        if self.max_frames is not None and m_length < self.max_frames:
+            pad = torch.zeros(self.max_frames - m_length, D, dtype=window.dtype)
+            window = torch.cat([window, pad], dim=0)
+
+        # Caption: first non-empty line; strip tail after '#'
+        cap_path = os.path.join(self.text_dir, f"{meta['motion_id']}.txt")
+        caption = "a person is moving"
+        if os.path.exists(cap_path):
+            with open(cap_path, "r", encoding="utf-8") as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    caption = ln.split("#")[0].strip() or caption
+                    break
+
+        # style_idx = -1 for HumanML3D
+        return caption, window, int(m_length), -1
+    
+
+DATASET_REGISTRY = {
+    "Dataset100STYLE"  : Dataset100STYLE,
+    "DatasetHumanML3D" : DatasetHumanML3D
+}
+    
