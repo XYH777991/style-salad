@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 import random
 
@@ -104,10 +105,93 @@ def main():
     style_names = [dataset.idx_to_style[i] for i in range(len(dataset.idx_to_style))]
     model.set_style_text_prior(style_names)
 
-    optimizer = torch.optim.Adam(
-        (p for p in model.parameters() if p.requires_grad),
-        lr=config['lr']
-    )
+    # Optional Phase 1: pretrain style_encoder with supcon ALONE, before the
+    # diffusion objective ever gets a chance to compete for its parameters.
+    # supcon.weight x4 (see metrics_ours_train_stattn_supcon4.csv) and a
+    # detached split head (metrics_ours_train_stattn_splithead.csv) both
+    # left SRA essentially unchanged -- suggesting supcon's gradient into
+    # the trunk was never large enough to compete with the diffusion loss
+    # in the first place, whether shared or isolated. This sidesteps that
+    # entirely: for `pretrain_style_epochs` epochs (additional, not counted
+    # against `epochs`), the denoiser is not even run -- style_encoder is
+    # the ONLY thing being trained, with supcon as its ONLY loss. Phase 2
+    # (below, unchanged) then proceeds exactly as every earlier experiment,
+    # starting from this supcon-organized trunk instead of a random init.
+    pretrain_style_epochs = int(config.get("pretrain_style_epochs", 0))
+    if pretrain_style_epochs > 0:
+        print(f"=== Phase 1: pretraining style_encoder with supcon only ({pretrain_style_epochs} epochs) ===")
+        phase1_optimizer = torch.optim.Adam(model.style_encoder.parameters(), lr=config["lr"])
+        supcon_spec = config["loss"]["supcon"]
+        model.train()
+        for p1_epoch in range(1, pretrain_style_epochs + 1):
+            p1_pbar = tqdm(dataloader, total=len(dataloader), desc=f"[Pretrain style] Epoch {p1_epoch}")
+            p1_loss_sum = 0.0
+            p1_n = 0
+            for batch in p1_pbar:
+                p1_captions, p1_motions, p1_num_frames, p1_style_idxs, _p1_content_idxs = batch
+                p1_motions = p1_motions.to(device)
+                p1_num_frames = p1_num_frames.to(device)
+                p1_style_idxs = p1_style_idxs.to(device)
+                phase1_optimizer.zero_grad(set_to_none=True)
+
+                with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                    p1_latent, p1_len_mask = model._encode_motion_latent(p1_motions, p1_num_frames)
+                    p1_style = model._extract_style_embedding(p1_latent, p1_len_mask)
+                    p1_loss = LOSS_REGISTRY["supcon"](
+                        supcon_spec, model, {"style": p1_style, "style_idx": p1_style_idxs}
+                    )
+
+                p1_loss.backward()
+                phase1_optimizer.step()
+                p1_loss_sum += float(p1_loss.item())
+                p1_n += 1
+                p1_pbar.set_postfix(supcon_loss=float(p1_loss.item()))
+
+            p1_mean = p1_loss_sum / max(1, p1_n)
+            print(f"[Pretrain style] Epoch {p1_epoch} | mean supcon loss: {p1_mean:.4f}")
+            if writer is not None:
+                writer.add_scalar("Pretrain/supcon_loss", p1_mean, p1_epoch)
+        print("=== Phase 1 done, entering normal joint training ===")
+
+    # The content classifier is freshly initialized and has to learn a
+    # 7-way task from scratch in ~9400 steps; sharing the main lr (tuned for
+    # fine-tuning an already-pretrained backbone) left it stuck at the
+    # random-guess loss the whole run even with a GRL warmup schedule (see
+    # metrics_ours_train_stattn_advcontent_warmup.csv). Give it its own,
+    # separately-configurable, higher lr instead.
+    if model.content_adversary is not None:
+        adv_params = list(model.content_adversary.net.parameters())
+        adv_param_ids = {id(p) for p in adv_params}
+        other_params = [p for p in model.parameters() if p.requires_grad and id(p) not in adv_param_ids]
+        adv_lr = float(config.get("content_adversary_lr", config["lr"] * 10))
+        optimizer = torch.optim.Adam([
+            {"params": other_params, "lr": config["lr"]},
+            {"params": adv_params, "lr": adv_lr},
+        ])
+        print(f"content_adversary.net lr={adv_lr} (main lr={config['lr']})")
+    else:
+        optimizer = torch.optim.Adam(
+            (p for p in model.parameters() if p.requires_grad),
+            lr=config['lr']
+        )
+
+    # EMA of trainable weights (opt-in, off by default so existing configs are
+    # unaffected). Uses a warmup schedule so the shadow isn't dominated by the
+    # noisy random-init weights early in the (short, ~9-10k step) training run:
+    # decay ramps from 0 up to config.ema.decay over the first few hundred steps.
+    ema_cfg = config.get("ema", {}) or {}
+    ema_enabled = bool(ema_cfg.get("enabled", False))
+    ema_decay = float(ema_cfg.get("decay", 0.9995))
+    ema_warmup = bool(ema_cfg.get("warmup", True))
+    ema_shadow = None
+    ema_step = 0
+    if ema_enabled:
+        ema_shadow = {
+            n: p.detach().clone()
+            for n, p in model.named_parameters()
+            if p.requires_grad
+        }
+        print(f"EMA enabled: decay={ema_decay}, warmup={ema_warmup}")
 
     # Losses
     loss_cfg = config['loss']
@@ -127,11 +211,13 @@ def main():
     with torch.no_grad():
         for i, batch in enumerate(pbar):
             if i >= config['steps']: break
-            captions, motions, num_frames, style_idxs = batch
-            motions, num_frames, style_idxs = motions.to(device), num_frames.to(device), style_idxs.to(device)
+            captions, motions, num_frames, style_idxs, content_idxs = batch
+            motions, num_frames, style_idxs, content_idxs = (
+                motions.to(device), num_frames.to(device), style_idxs.to(device), content_idxs.to(device)
+            )
 
             with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
-                out = model(captions, motions, num_frames, style_idxs)
+                out = model(captions, motions, num_frames, style_idxs, content_idx=content_idxs)
                 losses = {}
                 losses_denoiser = {}
                 for name, fn in loss_fns.items():
@@ -166,6 +252,19 @@ def main():
                 scales[name] = 1.0
         print("Frozen RMS denominators:", {k: round(v, 6) for k, v in scales.items()})
 
+    # GRL lambda warmup (DANN-style, Ganin & Lempitsky 2015): ramp 0 -> the
+    # configured lambda_ over training instead of using full strength from
+    # step 1. A fixed lambda from the start left the content classifier
+    # stuck at the random-guess cross-entropy the whole run (see
+    # metrics_ours_train_stattn_advcontent.csv / tensorboard) -- the
+    # reversed gradient erased any discriminative signal the classifier
+    # found before it had a chance to learn it, so nothing ever adapted.
+    adv_lambda_max = 0.0
+    if model.content_adversary is not None:
+        adv_lambda_max = model.content_adversary.grl.lambda_
+    total_steps = config['epochs'] * len(dataloader)
+    global_step = 0
+
     # Training
     model.train()
     for epoch in range(1, config['epochs'] + 1):
@@ -181,14 +280,20 @@ def main():
 
         batch_idx = -1
         for batch_idx, batch in enumerate(pbar):
-            captions, motions, num_frames, style_idxs = batch
+            captions, motions, num_frames, style_idxs, content_idxs = batch
             motions = motions.to(device)
             num_frames = num_frames.to(device)
             style_idxs = style_idxs.to(device)
+            content_idxs = content_idxs.to(device)
             optimizer.zero_grad(set_to_none=True)
 
+            if model.content_adversary is not None:
+                progress = global_step / max(1, total_steps - 1)
+                model.content_adversary.grl.lambda_ = adv_lambda_max * (2.0 / (1.0 + math.exp(-10.0 * progress)) - 1.0)
+            global_step += 1
+
             with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
-                out = model(captions, motions, num_frames, style_idxs)
+                out = model(captions, motions, num_frames, style_idxs, content_idx=content_idxs)
                 losses = {}
                 losses_denoiser = {}
                 for name, fn in loss_fns.items():
@@ -209,6 +314,15 @@ def main():
 
             total_loss.backward()
             optimizer.step()
+
+            if ema_enabled:
+                ema_step += 1
+                decay = min(ema_decay, (1 + ema_step) / (10 + ema_step)) if ema_warmup else ema_decay
+                with torch.no_grad():
+                    for n, p in model.named_parameters():
+                        if n in ema_shadow:
+                            ema_shadow[n].mul_(decay).add_(p.detach(), alpha=1.0 - decay)
+
             pbar.set_postfix(loss=float(total_loss.item()))
 
             all_losses = {}
@@ -235,6 +349,9 @@ def main():
                 writer.add_scalar(f"Train/Norm/{name}",   losses_norm_sum[name]   / num_batches, epoch)
                 writer.add_scalar(f"Train/Scaled/{name}", losses_scaled_sum[name] / num_batches, epoch)
 
+            if model.content_adversary is not None:
+                writer.add_scalar("Train/GRL_lambda", model.content_adversary.grl.lambda_, epoch)
+
         print(
             f"Epoch {epoch} | "
             f"Train scaled: {train_total_scaled:.4f} | "
@@ -255,6 +372,14 @@ def main():
                 sd_trainable,
                 os.path.join(config["checkpoint_dir"], f"epoch_{epoch:04d}.ckpt")
             )
+
+        if ema_enabled:
+            torch.save(ema_shadow, os.path.join(config["checkpoint_dir"], "latest_ema.ckpt"))
+            if save_every and (epoch % save_every == 0):
+                torch.save(
+                    ema_shadow,
+                    os.path.join(config["checkpoint_dir"], f"epoch_{epoch:04d}_ema.ckpt")
+                )
 
         if tsne_every > 0 and epoch % tsne_every == 0:
             plot_tsne(

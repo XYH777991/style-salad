@@ -29,7 +29,7 @@ def list_cut_average(ll, intervals):
     return ll_new
 
 
-def plot_3d_motion(save_path, kinematic_tree, joints, title, dataset, figsize=(3, 3), fps=120, radius=3,
+def plot_3d_motion(save_path, kinematic_tree, joints, title, dataset, figsize=(5, 5), fps=120, radius=3,
                    vis_mode='default', gt_frames=[]):
     matplotlib.use('Agg')
 
@@ -71,6 +71,10 @@ def plot_3d_motion(save_path, kinematic_tree, joints, title, dataset, figsize=(3
     fig = plt.figure(figsize=figsize)
     plt.tight_layout()
     ax = p3.Axes3D(fig)
+    # matplotlib >= 3.4 no longer auto-attaches Axes3D(fig) to the figure --
+    # without this, nothing gets drawn and every saved frame is blank (see
+    # memory: style-salad-plot3d-blank-video-bug).
+    fig.add_axes(ax)
     init()
     MINS = data.min(axis=0).min(axis=0)
     MAXS = data.max(axis=0).max(axis=0)
@@ -101,7 +105,7 @@ def plot_3d_motion(save_path, kinematic_tree, joints, title, dataset, figsize=(3
         # ax.collections = []
         ax.clear()
         ax.view_init(elev=120, azim=-90)
-        ax.dist = 7.5
+        ax.dist = 5.0  # was 7.5 -- brought the camera in closer so the figure fills more of the frame
         #         ax =
         plot_xzPlane(MINS[0] - trajec[index, 0], MAXS[0] - trajec[index, 0], 0, MINS[2] - trajec[index, 1],
                      MAXS[2] - trajec[index, 1])
@@ -177,10 +181,15 @@ def simple_plot_3d_motion(
     ax.set_title(title)
 
     ax.set_xlim([cx - half, cx + half])
-    ax.set_ylim([cz - half, cz + half])  # z on Y-axis for nicer top view
-    ax.set_zlim([cy - half * 0.2, cy + half * 1.2])  # y is "up"
+    ax.set_ylim([cz - half, cz + half])  # z (depth) on the plot's Y axis
+    ax.set_zlim([cy - half * 0.2, cy + half * 1.2])  # y (height) on the plot's Z axis, "up"
 
-    ax.view_init(elev=120, azim=-90)
+    # elev=120 was copied from plot_3d_motion's view_init, but that function feeds
+    # height directly into matplotlib's Z axis via a different mapping than the
+    # x/z/y -> plot-X/Y/Z remap just above -- reusing its angle here pointed the
+    # camera almost straight down. elev=15 is a normal side-on eye-level view for
+    # this function's own (height-on-Z) axis convention.
+    ax.view_init(elev=15, azim=-90)
     ax.grid(False)
     ax.set_xticklabels([])
     ax.set_yticklabels([])

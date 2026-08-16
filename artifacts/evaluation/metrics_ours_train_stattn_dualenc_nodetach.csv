@@ -1,0 +1,2 @@
+run,style_weight,style_guidance,Matching_score,gt_Matching_score,R_precision_top_1,R_precision_top_2,R_precision_top_3,gt_R_precision_top_1,gt_R_precision_top_2,gt_R_precision_top_3,FID,SRA,SRA_3,SRA_5,skate_ratio,Inference_time,Diversity,gt_Diversity
+reruns/ours_train_stattn_dualenc_nodetach,1.5,0.75,3.867870330810547,2.989698648452759,0.4017241299152374,0.5775862336158752,0.678017258644104,0.5178879499435425,0.7004310488700867,0.793749988079071,2.2334996140403547,71.70259094238281,84.22413635253906,87.86637878417969,0.16227426930963457,2.487579270066886,7.535956,9.994226

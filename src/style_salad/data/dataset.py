@@ -208,7 +208,7 @@ class Dataset100STYLE(Dataset):
 
         content_key = self.idx_to_content[meta["content_idx"]]
         caption = self.content_prompts[content_key]
-        return caption, window, int(m_length), int(meta["style_idx"])
+        return caption, window, int(m_length), int(meta["style_idx"]), int(meta["content_idx"])
 
 
 class DatasetHumanML3D(Dataset):

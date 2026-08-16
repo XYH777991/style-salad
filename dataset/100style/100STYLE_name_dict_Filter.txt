@@ -7364,7 +7364,7 @@ M037971 Zombie_BR_00.bvh 46
 M037972 Zombie_BR_01.bvh 46
 037973 Zombie_BR_02.bvh 46
 M037973 Zombie_BR_02.bvh 46
-037974 Zombie_BR_03.b037912vh 46
+037974 Zombie_BR_03.bvh 46
 M037974 Zombie_BR_03.bvh 46
 037975 Zombie_BR_04.bvh 46
 M037975 Zombie_BR_04.bvh 46

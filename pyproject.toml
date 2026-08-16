@@ -27,7 +27,9 @@ dependencies = [
     "tensorboard",
     "torchmetrics",
     "tqdm",
-    "transformers",
+    # transformers>=5 dropped transformers.utils.move_cache, which the vendored
+    # salad/models/denoiser/clip.py still imports; pin below that break.
+    "transformers<5",
 ]
 
 [project.scripts]

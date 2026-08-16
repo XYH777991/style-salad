@@ -10,6 +10,7 @@ from tqdm import tqdm
 
 from style_salad.models.denoiser import DENOISER_REGISTRY
 from style_salad.models.style import STYLE_REGISTRY
+from style_salad.models.adversary import ContentAdversary
 from salad.models.vae.model import VAE
 from salad.utils.get_opt import get_opt
 from style_salad.utils.motion import recover_from_ric, recover_root_rot_pos
@@ -30,6 +31,95 @@ class Text2StylizedMotion(nn.Module):
         style_encoder_cfg = {k: v for k, v in config["style_encoder"].items() if k != "class"}
         self.style_encoder = STYLE_REGISTRY[style_encoder_class](style_encoder_cfg).to(self.device)
         self.denoiser = load_denoiser(config["denoiser"], self.opt, self.vae_opt.latent_dim).to(self.device)
+
+        # Optional, training-only: predicts content_idx from the style
+        # embedding through a gradient-reversal layer, so the style encoder
+        # gets pushed to make content unpredictable from `s` instead of just
+        # relying on supcon to sort it out on its own. Absent from configs
+        # without a `content_adversary:` block -- fully backward compatible.
+        adv_cfg = config.get("content_adversary")
+        self.content_adversary = None
+        if adv_cfg:
+            self.content_adversary = ContentAdversary(
+                style_dim=int(config["style_encoder"]["style_dim"]),
+                num_classes=int(adv_cfg["num_classes"]),
+                hidden_dim=int(adv_cfg.get("hidden_dim", 128)),
+                lambda_=float(adv_cfg.get("lambda_", 1.0)),
+            ).to(self.device)
+
+        # Optional, training-only: architectural split so supcon (and any
+        # future content_adversarial loss) no longer competes with the
+        # diffusion loss for control of the SAME vector. This head reads a
+        # DETACHED copy of the style embedding, so its gradient can only
+        # reshape its own small weights -- it can never reach back into the
+        # style_encoder / mixing trunk that also drives HyperLoRA. That
+        # trunk stays free to optimize purely for the diffusion objective
+        # (unconstrained, keeping the FID/R-Precision gains from cross-cell
+        # mixing); this head is free to reorganize whatever style signal
+        # survives without fighting the trunk for it. See
+        # artifacts/STYLE_ENCODER_RESEARCH_LOG.md section 6 -- five attempts
+        # to make supcon/adversarial pressure win that fight on a SHARED
+        # vector all failed (AutoVC-style architectural bypass instead of
+        # loss balancing, Qian et al. ICML 2019).
+        readout_cfg = config.get("style_readout")
+        self.style_readout = None
+        if readout_cfg:
+            style_dim = int(config["style_encoder"]["style_dim"])
+            hidden_dim = int(readout_cfg.get("hidden_dim", style_dim))
+            self.style_readout = nn.Sequential(
+                nn.Linear(style_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, style_dim),
+            ).to(self.device)
+
+        # Dual-encoder split (artifacts/STYLE_ENCODER_RESEARCH_LOG.md #16):
+        # content-leakage into the mixing-based style_encoder is present even
+        # at random init and barely changes with training -- it's a property
+        # of cross-cell mixing itself, not something any loss-side trick can
+        # train away (#7-#15 all failed for exactly this reason). So instead
+        # of trying to purify style_encoder's own output, add a SEPARATE,
+        # independent encoder (no mixing, e.g. StyleMLP) with its own
+        # parameters that never touch the mixing trunk. Its output:
+        #   - trains supcon directly (own weights, full gradient -- nothing
+        #     to protect it from since it shares no parameters with the
+        #     mixing trunk to begin with)
+        #   - is combined (detached first) with style_encoder's output and
+        #     fed to HyperLoRA, so it actually participates in generation
+        #     instead of being a loss-side-only artifact like style_readout
+        #     (#12) was. The detach means the diffusion loss's gradient can
+        #     shape style_combiner and style_encoder, but never this pure
+        #     branch -- only supcon does.
+        #
+        # detach_from_generation (default True, backward compatible): the
+        # 4-seed dualenc result (see memory: style-salad-dualenc-seed-
+        # distribution) shows SRA_5 sitting a real ~4.6pt below the
+        # StyleMLP baseline (z=-3.43) even though style_combiner isn't
+        # diluting s_pure (analyze_combiner_weights.py ruled that out). One
+        # remaining difference from the baseline: the baseline's single
+        # StyleMLP encoder is trained by BOTH the diffusion loss and supcon
+        # on the same weights, while pure_style_encoder here only ever sees
+        # supcon. Unlike style_encoder, pure_style_encoder has no cross-cell
+        # mixing, so it shouldn't inherit the content-bias-at-init problem
+        # that made the diffusion gradient harmful for the mixing branch
+        # (#16) -- so protecting it via detach may just be starving it of a
+        # useful signal rather than protecting it from a harmful one. Set
+        # False to let the diffusion loss's gradient also reach
+        # pure_style_encoder through this path, matching the baseline's
+        # training regime, as an ablation.
+        pure_cfg = config.get("pure_style_encoder")
+        self.pure_style_encoder = None
+        self.style_combiner = None
+        self.detach_pure_branch = True
+        if pure_cfg:
+            style_dim = int(config["style_encoder"]["style_dim"])
+            pure_class = pure_cfg.get("class", "StyleMLP")
+            self.detach_pure_branch = bool(pure_cfg.get("detach_from_generation", True))
+            pure_encoder_cfg = {
+                k: v for k, v in pure_cfg.items() if k not in ("class", "detach_from_generation")
+            }
+            pure_encoder_cfg.setdefault("style_dim", style_dim)
+            self.pure_style_encoder = STYLE_REGISTRY[pure_class](pure_encoder_cfg).to(self.device)
+            self.style_combiner = nn.Linear(style_dim * 2, style_dim).to(self.device)
 
         self.scheduler = DDIMScheduler(
             num_train_timesteps=self.opt.num_train_timesteps,
@@ -132,17 +222,57 @@ class Text2StylizedMotion(nn.Module):
     def _extract_style_embedding(self, latent, len_mask):
         return F.normalize(self.style_encoder(latent, len_mask), dim=1)
 
+    def _apply_style_readout(self, raw_style):
+        """Style-loss-facing view of the style embedding. With style_readout
+        configured, this reads a DETACHED copy of raw_style, so whatever
+        loss consumes the result (supcon, content_adversarial) can only
+        reshape the readout head's own weights -- never the style_encoder /
+        mixing trunk, which stays driven purely by the diffusion objective.
+        Without style_readout configured (default), this is the identity --
+        fully backward compatible with every earlier experiment."""
+        if self.style_readout is None:
+            return raw_style
+        return self.style_readout(raw_style.detach())
+
+    def _style_embeddings(self, latent, len_mask):
+        """Returns (style_for_gen, style_for_loss).
+
+        style_for_gen: conditions HyperLoRA/the denoiser -- used for both
+        training's style_swapped and generation's ctx["style"]/guidance
+        candidate, so train and inference see the same kind of signal.
+
+        style_for_loss: what supcon (and content_adversarial, if configured)
+        actually trains.
+
+        Without pure_style_encoder configured, both fall back to the
+        existing single-encoder behavior (style_readout still applies to
+        style_for_loss if that's configured) -- fully backward compatible.
+
+        detach_pure_branch (see __init__) controls whether the diffusion
+        loss's gradient, arriving via `combined`, is allowed to reach
+        pure_style_encoder. True (default) matches every earlier
+        experiment; False is the "let both losses train it, like the
+        baseline does" ablation."""
+        s_gen = self._extract_style_embedding(latent, len_mask)
+        if self.pure_style_encoder is None:
+            return s_gen, self._apply_style_readout(s_gen)
+
+        s_pure = F.normalize(self.pure_style_encoder(latent, len_mask), dim=1)
+        pure_for_gen = s_pure.detach() if self.detach_pure_branch else s_pure
+        combined = self.style_combiner(torch.cat([s_gen, pure_for_gen], dim=1))
+        return combined, s_pure
+
     def _decode_motion_latent(self, x0_hat, motion_len_mask):
         decoded_motion = self.vae.decode(x0_hat)
         return decoded_motion * motion_len_mask[..., None].float()
 
-    def forward(self, text, motion, num_frames, style_label):
+    def forward(self, text, motion, num_frames, style_label, content_idx=None):
         text = ["" if np.random.rand() < self.config["text_drop"] else t for t in text]
         latent, len_mask = self._encode_motion_latent(motion, num_frames)
-        style = self._extract_style_embedding(latent, len_mask)
+        style_for_gen, style_for_loss = self._style_embeddings(latent, len_mask)
 
-        swap_idx = torch.arange(style.size(0), device=style.device) ^ 1
-        style_swapped = style[swap_idx]
+        swap_idx = torch.arange(style_for_gen.size(0), device=style_for_gen.device) ^ 1
+        style_swapped = style_for_gen[swap_idx]
 
         timesteps = torch.randint(
             0,
@@ -178,8 +308,10 @@ class Text2StylizedMotion(nn.Module):
             "latent": latent,
             "timesteps": timesteps,
             "noise": noise,
-            "style": style,
+            "style": style_for_loss,
+            "style_gen": style_for_gen,
             "style_idx": style_label,
+            "content_idx": content_idx,
             "len_mask": len_mask,
         }
 
@@ -191,7 +323,11 @@ class Text2StylizedMotion(nn.Module):
         m_lens = m_lens.to(self.device)
         style_label = style_label.to(self.device)
         latent, len_mask = self._encode_motion_latent(motion, m_lens)
-        style = self._extract_style_embedding(latent, len_mask)
+        # Plot whatever supcon actually trains (style_for_loss), not the
+        # generation-facing signal -- with pure_style_encoder configured
+        # that's the pure branch, which is the space we actually want a
+        # sanity-check t-SNE of.
+        _, style = self._style_embeddings(latent, len_mask)
         return style, style_label
 
     def generate(
@@ -316,7 +452,8 @@ class Text2StylizedMotion(nn.Module):
 
         with torch.no_grad():
             latent, _ = self.vae.encode(motion)
-            style = self._extract_style_embedding(latent, style_len_mask).detach()
+            style, _ = self._style_embeddings(latent, style_len_mask)
+            style = style.detach()
 
             uncond_word_emb, uncond_ca_mask, uncond_token_pos = self.denoiser.clip_model.encode_text([""] * B)
             uncond_word_emb = self.denoiser.word_emb(uncond_word_emb)
@@ -849,7 +986,14 @@ class Text2StylizedMotion(nn.Module):
         return guidance_scale * grad, loss_dict.get("style", torch.zeros((), device=z.device))
 
     def _style_guidance_loss(self, x0_hat, len_mask, style_target):
-        style = self.style_encoder(x0_hat, len_mask)
+        # Compare in the same space style_target came from (ctx["style"], via
+        # _style_embeddings) instead of the raw mixing-only trunk output, so
+        # guidance pulls z toward matching the actual generation-facing
+        # signal rather than a differently-scaled quantity. Gradient still
+        # reaches z through the style_encoder/style_combiner branch; the
+        # pure_style_encoder branch (if configured) is detached inside
+        # _style_embeddings, same as during training.
+        style, _ = self._style_embeddings(x0_hat, len_mask)
         return F.mse_loss(style, style_target, reduction="mean")
 
     def _trajectory_guidance_loss(self, decoded_motion, motion_len_mask, trajectory_cfg):
