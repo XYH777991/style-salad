@@ -8,7 +8,8 @@ build/
 dist/
 *.egg-info/
 
-artifacts/
+artifacts/run_logs/
+artifacts/tensorboard/
 outputs/*
 !outputs/.gitkeep
 outputs/**/mirrored_supcon*/

@@ -1,0 +1,2 @@
+run,style_weight,style_guidance,Matching_score,gt_Matching_score,R_precision_top_1,R_precision_top_2,R_precision_top_3,gt_R_precision_top_1,gt_R_precision_top_2,gt_R_precision_top_3,FID,SRA,SRA_3,SRA_5,skate_ratio,Inference_time,Diversity,gt_Diversity
+reruns/ours_train_stattn_lowdiff,1.5,0.75,3.563939094543457,2.9747633934020996,0.4375,0.6310344934463501,0.7336207032203674,0.5086206793785095,0.7002155184745789,0.798491358757019,2.0202747397641616,29.439655303955078,47.155174255371094,55.40948486328125,0.11619068514360045,1.9419686448985132,8.662184,8.618107
