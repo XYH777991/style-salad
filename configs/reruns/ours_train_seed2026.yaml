@@ -1,0 +1,115 @@
+run_name: reruns/ours_train_seed2026
+result_dir: ./outputs
+checkpoint_dir: ./checkpoints/t2sm
+checkpoint_name: epoch_0100.ckpt
+random_seed: 2026
+
+# Evaluation/runtime assets.
+style_classifier_path: ./checkpoints/style_classifier/style_classifier.pt
+style_classifier_nclasses: 47
+style_name_dict_path: ./dataset/100style/100STYLE_name_dict_Filter.txt
+style_mean_path: ./dataset/100style/Mean.npy
+style_std_path: ./dataset/100style/Std.npy
+eval_mean_path: ./checkpoints/t2m/Comp_v6_KLD01/meta/mean.npy
+eval_std_path: ./checkpoints/t2m/Comp_v6_KLD01/meta/std.npy
+t2m_evaluator_checkpoint_dir: ./checkpoints
+glove_dir: ./glove
+glove_vocab: our_vab
+eval_humanml_split_file: ./dataset/100style/test_humanml.txt
+eval_style_split_file: ./dataset/100style/test_100STYLE_Filter.txt
+humanml_motion_dir: ./dataset/humanml3d/new_joint_vecs
+humanml_text_dir: ./dataset/humanml3d/texts
+style_motion_dir: ./dataset/100style/new_joint_vecs
+style_text_dir: ./dataset/100style/texts
+
+dataset_style:
+  motion_dir: ./dataset/100style/new_joint_vecs
+  mean_path: ./checkpoints/t2m/Comp_v6_KLD005/meta/mean.npy
+  std_path: ./checkpoints/t2m/Comp_v6_KLD005/meta/std.npy
+  style_json: ./dataset/100style/100style_smoodi.json
+  excluded_styles: []
+  content_json: ./dataset/100style/10content_smoodi.json
+  unit_length: 4
+  min_frames: 40
+  max_frames: 196
+  drop_first_frame: true
+  unit_double_prob: 0.3333
+
+# Training uses 100STYLE. dataset_style is kept separately for generation.
+dataset:
+  class: Dataset100STYLE
+  motion_dir: ./dataset/100style/new_joint_vecs
+  mean_path: ./checkpoints/t2m/Comp_v6_KLD005/meta/mean.npy
+  std_path: ./checkpoints/t2m/Comp_v6_KLD005/meta/std.npy
+  style_json: ./dataset/100style/100style_smoodi.json
+  excluded_styles: []
+  content_json: ./dataset/100style/10content_smoodi.json
+  unit_length: 4
+  min_frames: 40
+  max_frames: 196
+  drop_first_frame: true
+  unit_double_prob: 0.3333
+
+sampler:
+  class: TrainSampler
+  batch_size: 64
+  samples_per_style: 4
+
+model:
+  denoiser_opt_path: ./checkpoints/t2m/t2m_denoiser_vpred_vaegelu/opt.txt
+  vae_opt_path: ./checkpoints/t2m/t2m_vae_gelu/opt.txt
+  denoiser:
+    class: HyperLoRADenoiser
+    transformer:
+      layer:
+        attention:
+          skeletal: {}
+          temporal: {}
+          cross: {}
+        film:
+          lora:
+            class: HyperLoRA
+            rank: 2
+            scale: 1.0
+            style_dim: 256
+            num_layers: 4
+            in_dim: 256
+            out_dim: 512
+            hidden_dim: 512
+            block:
+              dropout: 0.1
+              style_dim: 256
+              hidden_dim: 512
+              num_heads: 8
+  style_encoder:
+    class: StyleMLP
+    dropout: 0.1
+    style_dim: 256
+    num_layers: 4
+    block:
+      dropout: 0.1
+      style_dim: 256
+      hidden_dim: 512
+      num_heads: 8
+      repeats: 2
+  text_drop: 0.1
+  style_drop: 0.1
+  text_weight: 7.5
+  style_weight: 1.5
+  style_guidance: 0.75
+
+loss:
+  style:
+    weight: 1.0
+  supcon:
+    weight: 1.0
+    temperature: 0.07
+
+steps: 34
+tau: 0.001
+epochs: 100
+lr: 0.0001
+valid_size: 0.0
+save_every: 10
+tsne_every: 10
+tsne_max_samples: 1000
