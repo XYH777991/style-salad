@@ -69,9 +69,33 @@ def loss_soft_supcon(config, model, out):
     return -(target * log_p).sum(dim=1).mean()
 
 
+def loss_content_adversarial(config, model, out):
+    """Cross-entropy of model.content_adversary's prediction of content_idx
+    from the (un-detached) style embedding. self.net inside ContentAdversary
+    learns normally to predict content well; the GradientReversal layer
+    negates what flows back past it, so this same loss pushes the style
+    encoder to make content unpredictable from `s` (Ganin & Lempitsky 2015 /
+    Lample et al. 2017 mechanism -- see models/adversary.py)."""
+    if model.content_adversary is None:
+        raise ValueError(
+            "loss_content_adversarial requires a content_adversary: block under "
+            "model: in the config (see models/t2sm.py Text2StylizedMotion.__init__)."
+        )
+    content_idx = out.get("content_idx")
+    if content_idx is None:
+        raise ValueError(
+            "loss_content_adversarial requires content_idx in the batch. "
+            "Dataset100STYLE.__getitem__ returns it as the 5th element; make "
+            "sure the training loop unpacks and forwards it."
+        )
+    logits = model.content_adversary(out["style"])
+    return F.cross_entropy(logits, content_idx)
+
+
 LOSS_REGISTRY = {
     "style"   : loss_style,
     "supcon"  : loss_supcon,
     "soft_supcon": loss_soft_supcon,
+    "content_adversarial": loss_content_adversarial,
 }
     
