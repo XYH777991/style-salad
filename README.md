@@ -161,6 +161,48 @@ style-salad-train --config configs/ours.yaml
 Training requires a CUDA-capable GPU. It writes checkpoints to
 `checkpoints/t2sm/ours/` and logs/plots under `outputs/ours/` and `artifacts/`.
 
+## Style encoder research: an improved training recipe
+
+`configs/ours.yaml` (above) is the released checkpoint, tracked as-is. This
+fork also contains a from-scratch investigation into a real gap between
+that released checkpoint and this codebase's own retrains of the same
+recipe, plus a fix. Full writeup, every experiment tried (including the
+ones that didn't work and why), and every raw config/log/eval CSV behind
+it are in `artifacts/STYLE_ENCODER_RESEARCH_LOG.md`.
+
+**Current recommended recipe**:
+`configs/reruns/ours_train_stattn_dualenc_nodetach.yaml`. In short: a
+`StyleSTAttn` mixing encoder (temporal + skeletal self-attention before
+pooling) drives generation, fused via `style_combiner` with a separate,
+non-mixing `pure_style_encoder` that trains directly on the contrastive
+loss and is *not* protected from the diffusion objective's gradient
+(`detach_from_generation: false`). Result, averaged over 4 seeds: SRA_5 =
+87.88 ± 0.63, statistically tied with the hard-SupCon baseline's
+87.12 ± 1.35 (z = 0.56), with FID also tied and a small R-Precision@3 cost
+(z = −2.01).
+
+This recipe is a config + reproducible training run, **not** a tracked
+checkpoint — `checkpoints/t2sm/reruns/` is gitignored like every other
+from-scratch retrain in this repo (see Assets above; only
+`checkpoints/t2sm/ours/epoch_0100.ckpt` ships in git). To reproduce it:
+
+```bash
+style-salad-train --config configs/reruns/ours_train_stattn_dualenc_nodetach.yaml
+style-salad-evaluate --config configs/reruns/ours_train_stattn_dualenc_nodetach.yaml \
+  --csv_name metrics_dualenc_nodetach.csv
+```
+
+`configs/reruns/` also holds every other config from the investigation
+(seed variants, every ablation that was tried and ruled out) if you want
+to reproduce a specific research-log entry.
+
+A related, separate finding: generated motion tempo (how fast a style
+plays out) is not transferred by style guidance at all, regardless of
+recipe — root cause and an experimental (opt-in, not default)
+`tempo_guidance` sampling-time mitigation are documented in the same
+research log and in `src/style_salad/models/t2sm.py`
+(`_tempo_guidance_loss`).
+
 ## Acknowledgements
 
 This repository vendors a minimal subset of SALAD and MLD/SMooDi utility code
