@@ -178,6 +178,13 @@ def main():
 
     model = load_model(config, device)
     style_cfg = config["dataset_style"]
+    mean = torch.tensor(np.load(style_cfg["mean_path"]), dtype=torch.float32, device=device)
+    std = torch.tensor(np.load(style_cfg["std_path"]), dtype=torch.float32, device=device)
+    # Without this, _denormalize_motion (trajectory/keyframe/tempo
+    # guidance) silently no-ops on still-normalized motion instead of
+    # converting to real-world units -- see memory:
+    # style-salad-tempo-not-transferred and evaluate.py's same fix.
+    model.set_normalization_stats(mean, std)
     ds_style = Dataset100STYLE(style_cfg)
 
     ref_i = find_index_by_motion_id(ds_style, config["_cli"]["ref_motion_id"])
@@ -200,9 +207,6 @@ def main():
 
     generation_guidance = {"num_inference_steps": config["_cli"]["num_inference_steps"]}
     stylized, captions_out = model.generate(motions, captions, gen_lengths, style_lengths, guidance=generation_guidance)
-
-    mean = torch.tensor(np.load(style_cfg["mean_path"]), dtype=torch.float32, device=device)
-    std = torch.tensor(np.load(style_cfg["std_path"]), dtype=torch.float32, device=device)
 
     stylized = stylized * std + mean
     reference = motions * std + mean
