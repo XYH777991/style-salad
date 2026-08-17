@@ -16,6 +16,49 @@ def featurewise_affine(x, scale_shift):
     return x * (scale + 1) + shift
 
 
+class TemporalGate(nn.Module):
+    """Optional, opt-in per-frame gate on the style LoRA delta -- see memory:
+    style-salad-tempo-not-transferred. HyperLoRA computes A/B once per
+    generation from `style` alone (cached, reused for every denoising step
+    and every frame -- an explicit efficiency choice in the base Style-SALAD
+    paper, arXiv:2605.13333), so the delta it produces has no way to vary
+    across the motion's own frame axis. This module leaves A/B (and the
+    caching) untouched and instead learns a cheap per-frame scalar g_t that
+    scales the *delta* before it's added -- the minimum extra machinery
+    needed to give style an actual temporal degree of freedom.
+
+    Initialized so g_t == 1 for every frame at the start of training: the
+    last layer's weight and bias are zeroed, so `1.0 + 0` reproduces the
+    exact old (uniform, ungated) behavior. This means a checkpoint trained
+    without this gate can be *fine-tuned* with it added rather than
+    retrained from scratch -- training only has to learn deviations from
+    the identity gate, not the whole denoising process over again.
+    """
+
+    def __init__(self, style_dim, max_len=64, hidden_dim=64):
+        super().__init__()
+        self.frame_pos = nn.Parameter(torch.zeros(max_len, style_dim))
+        nn.init.normal_(self.frame_pos, std=0.02)
+        self.net = nn.Sequential(
+            nn.Linear(style_dim * 2, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, style, num_frames):
+        if num_frames > self.frame_pos.shape[0]:
+            raise ValueError(
+                f"TemporalGate: motion length {num_frames} exceeds max_len={self.frame_pos.shape[0]}."
+            )
+        B = style.shape[0]
+        pos = self.frame_pos[:num_frames][None].expand(B, num_frames, -1)     # (B, T, style_dim)
+        s = style[:, None, :].expand(B, num_frames, -1)                       # (B, T, style_dim)
+        g = self.net(torch.cat([s, pos], dim=-1)).squeeze(-1)                 # (B, T)
+        return 1.0 + g
+
+
 class DenseFiLM(nn.Module):
     def __init__(self, config, opt):
         super(DenseFiLM, self).__init__()
@@ -25,12 +68,19 @@ class DenseFiLM(nn.Module):
         )
 
         self.use_lora = False
+        self.temporal_gate = None
         if "lora" in config:
             lora_cfg = config["lora"]
             self.lora = LORA_REGISTRY[lora_cfg['class']](lora_cfg)
             self.use_lora = True
+            if bool(lora_cfg.get("temporal_gate", False)):
+                self.temporal_gate = TemporalGate(
+                    style_dim=int(lora_cfg["style_dim"]),
+                    max_len=int(lora_cfg.get("temporal_gate_max_len", 64)),
+                    hidden_dim=int(lora_cfg.get("temporal_gate_hidden_dim", 64)),
+                )
 
-    def forward(self, cond, style=None, style_mask=None):
+    def forward(self, cond, style=None, style_mask=None, num_frames=None):
         x  = self.linear[0](cond)
         y0 = self.linear[1](x)
 
@@ -41,6 +91,15 @@ class DenseFiLM(nn.Module):
             # Let mixed batches disable style modulation for selected rows.
             if style_mask is not None:
                 delta = delta * style_mask[:, None].to(delta.dtype)
+
+            if self.temporal_gate is not None and num_frames is not None:
+                g = self.temporal_gate(style, num_frames)          # (B, T)
+                delta_t = g[:, :, None] * delta[:, None, :]        # (B, T, D)
+                y = y0[:, None, :] + delta_t                       # (B, T, D)
+                y = y[:, :, None, :]                                # broadcast over J only
+                scale, shift = y.chunk(2, dim=-1)
+                return scale, shift
+
             y = y0 + delta
         else:
             y = y0
@@ -322,10 +381,10 @@ class STTransformerLayer(nn.Module):
 
         B, T, J, D = x.size()
 
-        skel_cond = self.skel_film(cond, style=style, style_mask=style_mask)
-        temp_cond = self.temp_film(cond, style=style, style_mask=style_mask)
-        cross_cond = self.cross_film(cond, style=style, style_mask=style_mask)
-        ffn_cond = self.ffn_film(cond, style=style, style_mask=style_mask)
+        skel_cond = self.skel_film(cond, style=style, style_mask=style_mask, num_frames=T)
+        temp_cond = self.temp_film(cond, style=style, style_mask=style_mask, num_frames=T)
+        cross_cond = self.cross_film(cond, style=style, style_mask=style_mask, num_frames=T)
+        ffn_cond = self.ffn_film(cond, style=style, style_mask=style_mask, num_frames=T)
 
         # Temporal attention
         x_t = x.transpose(1, 2).reshape(B * J, T, D)

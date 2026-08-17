@@ -104,6 +104,27 @@ def main():
     model = Text2StylizedMotion(model_cfg).to(device)
     style_names = [dataset.idx_to_style[i] for i in range(len(dataset.idx_to_style))]
     model.set_style_text_prior(style_names)
+    # Without this, _denormalize_motion (used by the new loss_tempo, and by
+    # trajectory/keyframe/tempo sampling guidance) silently no-ops on
+    # still-normalized motion -- see memory: style-salad-tempo-not-transferred
+    # and the same fix already applied in evaluate.py / get_teaser_current.py.
+    model.set_normalization_stats(np.load(dataset_cfg["mean_path"]), np.load(dataset_cfg["std_path"]))
+
+    # Optional: warm-start from an existing checkpoint instead of training
+    # from scratch -- e.g. fine-tuning in the newly added TemporalGate
+    # (models/transformer.py) onto an already-trained dual-encoder
+    # checkpoint. strict=False because init_checkpoint may be missing keys
+    # for newly added modules (they keep their own fresh init, e.g.
+    # TemporalGate's zero-init last layer -> identity gate at step 0) or
+    # have extra keys the current config doesn't use.
+    init_checkpoint_path = config.get("init_checkpoint_path")
+    init_sd = None
+    if init_checkpoint_path:
+        print(f"Warm-starting from checkpoint: {init_checkpoint_path}")
+        init_sd = torch.load(init_checkpoint_path, map_location=device)
+        missing, unexpected = model.load_state_dict(init_sd, strict=False)
+        print(f"  loaded with {len(missing)} missing keys (expected for newly added modules), "
+              f"{len(unexpected)} unexpected keys ignored")
 
     # Optional Phase 1: pretrain style_encoder with supcon ALONE, before the
     # diffusion objective ever gets a chance to compete for its parameters.
@@ -152,6 +173,27 @@ def main():
             if writer is not None:
                 writer.add_scalar("Pretrain/supcon_loss", p1_mean, p1_epoch)
         print("=== Phase 1 done, entering normal joint training ===")
+
+    # Optional: freeze every parameter whose name doesn't contain a given
+    # substring -- e.g. fine-tuning only the newly added TemporalGate
+    # (models/transformer.py) so loss_tempo's gradient can only ever touch
+    # the new mechanism, not perturb the rest of an already-good checkpoint.
+    # Isolates what the new mechanism alone can do, cleanly separated from
+    # "the rest of the network drifted during this fine-tune" as a
+    # confound. The later optimizer-building code below already filters on
+    # requires_grad, so this composes with it (and with content_adversary)
+    # without further changes.
+    train_only_matching = config.get("train_only_matching")
+    if train_only_matching:
+        n_trainable = n_frozen = 0
+        for name, p in model.named_parameters():
+            if train_only_matching in name:
+                p.requires_grad = True
+                n_trainable += 1
+            else:
+                p.requires_grad = False
+                n_frozen += 1
+        print(f"train_only_matching='{train_only_matching}': {n_trainable} trainable params, {n_frozen} frozen")
 
     # The content classifier is freshly initialized and has to learn a
     # 7-way task from scratch in ~9400 steps; sharing the main lr (tuned for
@@ -362,6 +404,16 @@ def main():
         trainable = {n for n, p in model.named_parameters() if p.requires_grad}
         sd = model.state_dict()
         sd_trainable = {k: v for k, v in sd.items() if k in trainable}
+        # If warm-started (init_checkpoint_path) with some parameters frozen
+        # (train_only_matching), sd_trainable alone would only contain the
+        # few params that were actually updated -- evaluate.py/
+        # get_teaser_current.py build a fresh model and load ONE checkpoint
+        # file directly, with no knowledge of init_checkpoint_path, so a
+        # partial checkpoint would silently leave everything else at random
+        # init. Merge onto the full initial state dict so every saved
+        # checkpoint here is self-contained and loads correctly on its own.
+        if init_sd is not None:
+            sd_trainable = {**init_sd, **sd_trainable}
 
         os.makedirs(config["checkpoint_dir"], exist_ok=True)
         torch.save(sd_trainable, os.path.join(config["checkpoint_dir"], "latest.ckpt"))

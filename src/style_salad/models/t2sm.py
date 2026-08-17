@@ -309,6 +309,16 @@ class Text2StylizedMotion(nn.Module):
         swap_idx = torch.arange(style_for_gen.size(0), device=style_for_gen.device) ^ 1
         style_swapped = style_for_gen[swap_idx]
 
+        # Training-time tempo target for the optional loss_tempo (see
+        # losses.py, memory: style-salad-tempo-not-transferred): the swap
+        # partner's own real-world speed -- same target definition as
+        # inference-time tempo_guidance (_prepare_sampling_context), just
+        # used here as an actual training signal for the TemporalGate
+        # (transformer.py) instead of sampling-time guidance.
+        motion_len_mask = frames_to_mask(num_frames).to(motion.device)
+        motion_real = self._denormalize_motion(motion)
+        tempo_target = self._mean_joint_speed(motion_real, motion_len_mask)[swap_idx]
+
         timesteps = torch.randint(
             0,
             self.opt.num_train_timesteps,
@@ -348,6 +358,8 @@ class Text2StylizedMotion(nn.Module):
             "style_idx": style_label,
             "content_idx": content_idx,
             "len_mask": len_mask,
+            "motion_len_mask": motion_len_mask,
+            "tempo_target": tempo_target,
         }
 
     @torch.no_grad()

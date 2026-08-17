@@ -92,10 +92,27 @@ def loss_content_adversarial(config, model, out):
     return F.cross_entropy(logits, content_idx)
 
 
+def loss_tempo(config, model, out):
+    """Training-time tempo-matching loss (see memory:
+    style-salad-tempo-not-transferred). Unlike the inference-only
+    tempo_guidance sampling-time term (t2sm.py sampling_guidance), this
+    trains the opt-in TemporalGate (models/transformer.py DenseFiLM) end to
+    end, so the model itself learns to vary its style modulation over the
+    frame axis -- instead of an external gradient forcing it there at
+    sampling time, which the dose-response sweep showed has a real,
+    monotonically-increasing FID/R-Prec/skate_ratio cost. Target: the swap
+    partner's own real-world speed (out["tempo_target"], computed in
+    Text2StylizedMotion.forward -- same definition as the inference-time
+    target in _prepare_sampling_context)."""
+    decoded = model._decode_motion_latent(out["pred_x0"], out["motion_len_mask"])
+    return model._tempo_guidance_loss(decoded, out["motion_len_mask"], out["tempo_target"])
+
+
 LOSS_REGISTRY = {
     "style"   : loss_style,
     "supcon"  : loss_supcon,
     "soft_supcon": loss_soft_supcon,
     "content_adversarial": loss_content_adversarial,
+    "tempo": loss_tempo,
 }
     
