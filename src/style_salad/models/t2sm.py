@@ -90,32 +90,47 @@ class Text2StylizedMotion(nn.Module):
         #     shape style_combiner and style_encoder, but never this pure
         #     branch -- only supcon does.
         #
-        # detach_from_generation (default True, backward compatible): the
-        # 4-seed dualenc result (see memory: style-salad-dualenc-seed-
-        # distribution) shows SRA_5 sitting a real ~4.6pt below the
-        # StyleMLP baseline (z=-3.43) even though style_combiner isn't
-        # diluting s_pure (analyze_combiner_weights.py ruled that out). One
-        # remaining difference from the baseline: the baseline's single
-        # StyleMLP encoder is trained by BOTH the diffusion loss and supcon
-        # on the same weights, while pure_style_encoder here only ever sees
-        # supcon. Unlike style_encoder, pure_style_encoder has no cross-cell
-        # mixing, so it shouldn't inherit the content-bias-at-init problem
-        # that made the diffusion gradient harmful for the mixing branch
-        # (#16) -- so protecting it via detach may just be starving it of a
-        # useful signal rather than protecting it from a harmful one. Set
-        # False to let the diffusion loss's gradient also reach
-        # pure_style_encoder through this path, matching the baseline's
-        # training regime, as an ablation.
+        # diffusion_grad_scale (default 0.0 = old detach_from_generation:
+        # True, backward compatible): the 4-seed dualenc result (see memory:
+        # style-salad-dualenc-seed-distribution) shows SRA_5 sitting a real
+        # ~4.6pt below the StyleMLP baseline (z=-3.43) even though
+        # style_combiner isn't diluting s_pure (analyze_combiner_weights.py
+        # ruled that out). One remaining difference from the baseline: the
+        # baseline's single StyleMLP encoder is trained by BOTH the
+        # diffusion loss and supcon on the same weights, while
+        # pure_style_encoder here only ever saw supcon under full detach.
+        # Unlike style_encoder, pure_style_encoder has no cross-cell mixing,
+        # so it shouldn't inherit the content-bias-at-init problem that made
+        # the diffusion gradient harmful for the mixing branch (#16) -- so
+        # protecting it via detach may just be starving it of a useful
+        # signal rather than protecting it from a harmful one.
+        # diffusion_grad_scale: 1.0 let the diffusion loss's gradient fully
+        # reach pure_style_encoder (old detach_from_generation: False) --
+        # closed the SRA_5 gap entirely (research log #18) but cost a small,
+        # borderline-significant amount of R-Prec@3 (z=-2.01). This is the
+        # continuous generalization: any value in [0, 1] scales how much of
+        # the diffusion loss's gradient reaches pure_style_encoder through
+        # this path (supcon's gradient on the un-detached s_pure, used for
+        # style_for_loss, is always full strength regardless), via the
+        # straight-through trick `alpha*x + (1-alpha)*x.detach()` -- forward
+        # value is unchanged (always x), only the backward gradient is
+        # scaled by alpha. Meant as a middle ground between #17 (0.0) and
+        # #18 (1.0) for whichever config sets an intermediate value.
         pure_cfg = config.get("pure_style_encoder")
         self.pure_style_encoder = None
         self.style_combiner = None
-        self.detach_pure_branch = True
+        self.diffusion_grad_scale = 0.0
         if pure_cfg:
             style_dim = int(config["style_encoder"]["style_dim"])
             pure_class = pure_cfg.get("class", "StyleMLP")
-            self.detach_pure_branch = bool(pure_cfg.get("detach_from_generation", True))
+            if "diffusion_grad_scale" in pure_cfg:
+                self.diffusion_grad_scale = float(pure_cfg["diffusion_grad_scale"])
+            else:
+                # legacy bool: True (default) -> 0.0 (full detach), False -> 1.0 (full gradient)
+                self.diffusion_grad_scale = 0.0 if bool(pure_cfg.get("detach_from_generation", True)) else 1.0
             pure_encoder_cfg = {
-                k: v for k, v in pure_cfg.items() if k not in ("class", "detach_from_generation")
+                k: v for k, v in pure_cfg.items()
+                if k not in ("class", "detach_from_generation", "diffusion_grad_scale")
             }
             pure_encoder_cfg.setdefault("style_dim", style_dim)
             self.pure_style_encoder = STYLE_REGISTRY[pure_class](pure_encoder_cfg).to(self.device)
@@ -248,17 +263,19 @@ class Text2StylizedMotion(nn.Module):
         existing single-encoder behavior (style_readout still applies to
         style_for_loss if that's configured) -- fully backward compatible.
 
-        detach_pure_branch (see __init__) controls whether the diffusion
-        loss's gradient, arriving via `combined`, is allowed to reach
-        pure_style_encoder. True (default) matches every earlier
-        experiment; False is the "let both losses train it, like the
-        baseline does" ablation."""
+        diffusion_grad_scale (see __init__) controls how much of the
+        diffusion loss's gradient, arriving via `combined`, is allowed to
+        reach pure_style_encoder. 0.0 (default) matches every earlier
+        experiment through #17; 1.0 is the "let both losses train it fully,
+        like the baseline does" ablation (#18); anything in between is a
+        continuous middle ground."""
         s_gen = self._extract_style_embedding(latent, len_mask)
         if self.pure_style_encoder is None:
             return s_gen, self._apply_style_readout(s_gen)
 
         s_pure = F.normalize(self.pure_style_encoder(latent, len_mask), dim=1)
-        pure_for_gen = s_pure.detach() if self.detach_pure_branch else s_pure
+        alpha = self.diffusion_grad_scale
+        pure_for_gen = alpha * s_pure + (1.0 - alpha) * s_pure.detach()
         combined = self.style_combiner(torch.cat([s_gen, pure_for_gen], dim=1))
         return combined, s_pure
 
