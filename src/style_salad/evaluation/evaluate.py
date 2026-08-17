@@ -220,6 +220,15 @@ class SmoodiEval():
         std = np.load(config.get("style_std_path", "./dataset/100style/Std.npy"))
         mean_eval = np.load(config.get("eval_mean_path", "./checkpoints/t2m/Comp_v6_KLD01/meta/mean.npy"))
         std_eval = np.load(config.get("eval_std_path", "./checkpoints/t2m/Comp_v6_KLD01/meta/std.npy"))
+        # ref_t2m (fed to model.generate() below) is renormed to this
+        # eval_mean/eval_std scale via dataset.renorm4t2m -- register it so
+        # _denormalize_motion (trajectory/keyframe/tempo guidance) can
+        # convert generated motion back to real-world units instead of
+        # silently no-oping on still-normalized values. Confirmed
+        # eval_mean/std == dataset_style's own mean/std byte-for-byte (both
+        # ultimately point at the same VAE training stats under different
+        # config keys), so this is consistent with every other caller.
+        self.model.set_normalization_stats(mean_eval, std_eval)
         w_vectorizer = WordVectorizer(config.get("glove_dir", "./glove"), config.get("glove_vocab", "our_vab"))
         dataset = Text2MotionTestDataset(
             mean=mean,

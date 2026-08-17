@@ -266,6 +266,24 @@ class Text2StylizedMotion(nn.Module):
         decoded_motion = self.vae.decode(x0_hat)
         return decoded_motion * motion_len_mask[..., None].float()
 
+    def _mean_joint_speed(self, motion_real, frame_mask, eps=1e-6):
+        """motion_real: (B, T, feat) denormalized motion, frame_mask: (B, T)
+        bool valid-raw-frame mask. Returns (B,) mean per-frame joint
+        displacement magnitude over valid consecutive-frame transitions --
+        the same "tempo" statistic used throughout
+        artifacts/speed_style_sweep.py / tempo_diagnostics.py (see memory:
+        style-salad-tempo-not-transferred). Differentiable: used both to
+        measure a reference clip's own tempo (_prepare_sampling_context)
+        and as a sampling-guidance loss on generated x0_hat
+        (_tempo_guidance_loss)."""
+        joints = recover_from_ric(motion_real, self.vae_opt.joints_num)  # (B, T, J, 3)
+        vel = joints[:, 1:] - joints[:, :-1]
+        speed = vel.norm(dim=-1)  # (B, T-1, J)
+        valid = (frame_mask[:, 1:] & frame_mask[:, :-1]).float()  # both frame endpoints must be valid
+        weight = valid[:, :, None].expand_as(speed)
+        denom = weight.sum(dim=(1, 2)).clamp_min(eps)
+        return (speed * weight).sum(dim=(1, 2)) / denom
+
     def forward(self, text, motion, num_frames, style_label, content_idx=None):
         text = ["" if np.random.rand() < self.config["text_drop"] else t for t in text]
         latent, len_mask = self._encode_motion_latent(motion, num_frames)
@@ -455,6 +473,18 @@ class Text2StylizedMotion(nn.Module):
             style, _ = self._style_embeddings(latent, style_len_mask)
             style = style.detach()
 
+            # Tempo guidance target (opt-in, see tempo_guidance in
+            # _generate_from_noise_with_step_guidance): the style reference
+            # clip's own mean per-frame joint speed, measured in raw motion
+            # space -- NOT style_len_mask, which is a latent-axis (T/4) mask
+            # for _style_embeddings. Needs its own raw-frame mask.
+            style_frame_mask = frames_to_mask(style_lengths).to(self.device)
+            style_frame_mask = F.pad(
+                style_frame_mask, (0, motion.shape[1] - style_frame_mask.shape[1]), mode="constant", value=False
+            )
+            motion_real_ref = self._denormalize_motion(motion)
+            tempo_target = self._mean_joint_speed(motion_real_ref, style_frame_mask).detach()
+
             uncond_word_emb, uncond_ca_mask, uncond_token_pos = self.denoiser.clip_model.encode_text([""] * B)
             uncond_word_emb = self.denoiser.word_emb(uncond_word_emb)
 
@@ -467,6 +497,7 @@ class Text2StylizedMotion(nn.Module):
             "len_mask": len_mask,
             "motion_len_mask": motion_len_mask,
             "style": style.detach(),
+            "tempo_target": tempo_target,
             "timesteps": timesteps,
             "z_shape": (B, lengths.max() // 4, 7, self.vae_opt.latent_dim),
             "uncond_word_emb": uncond_word_emb,
@@ -648,6 +679,12 @@ class Text2StylizedMotion(nn.Module):
         style_cfg = guidance.get("style", {})
         trajectory_cfg = guidance.get("trajectory")
         keyframe_cfg = guidance.get("keyframe", guidance.get("keyframes"))
+        # Tempo guidance (see memory: style-salad-tempo-not-transferred):
+        # experimental, "combined" inner_mode only, no per-step schedule yet
+        # (unlike style/trajectory/keyframe) -- first cut, keep it simple
+        # until it's shown to help.
+        tempo_cfg = guidance.get("tempo", {}) or {}
+        tempo_guidance_scale = float(tempo_cfg.get("weight", self.config.get("tempo_guidance", 0.0)))
         record_step_losses = bool(guidance.get("record_step_trajectory_loss", False))
         recompute_v_guided = bool(guidance.get("recompute_v_guided", False))
         guidance_inner_mode = str(guidance.get("inner_mode", "combined")).lower()
@@ -689,6 +726,7 @@ class Text2StylizedMotion(nn.Module):
                     style_guidance_scale_t > 0.0
                     or trajectory_guidance_scale_t > 0.0
                     or keyframe_guidance_scale_t > 0.0
+                    or tempo_guidance_scale > 0.0
                 )
                 z_in = z.detach().requires_grad_(use_sampling_guidance_now)
                 v_pred = self._predict_v(z_in, timestep, ctx)
@@ -711,6 +749,8 @@ class Text2StylizedMotion(nn.Module):
                                 keyframe_cfg=keyframe_cfg,
                                 trajectory_guidance_scale=trajectory_guidance_scale_t,
                                 keyframe_guidance_scale=keyframe_guidance_scale_t,
+                                tempo_target=ctx.get("tempo_target") if tempo_guidance_scale > 0.0 else None,
+                                tempo_guidance_scale=tempo_guidance_scale,
                                 normalize_grad=normalize_grad,
                             )
                             z_step = z_step - grad_z
@@ -923,6 +963,8 @@ class Text2StylizedMotion(nn.Module):
         keyframe_cfg=None,
         trajectory_guidance_scale=0.0,
         keyframe_guidance_scale=0.0,
+        tempo_target=None,
+        tempo_guidance_scale=0.0,
         normalize_grad=True,
         eps=1e-6,
     ):
@@ -955,6 +997,13 @@ class Text2StylizedMotion(nn.Module):
             key_loss = self._keyframe_guidance_loss(decoded_motion, lengths=motion_len_mask.sum(dim=1), keyframe_cfg=keyframe_cfg)
             total_loss = total_loss + keyframe_guidance_scale * key_loss
             loss_dict["keyframe"] = key_loss.detach()
+
+        if tempo_target is not None and tempo_guidance_scale > 0.0:
+            if decoded_motion is None:
+                decoded_motion = self._decode_motion_latent(x0_hat, motion_len_mask)
+            tempo_loss = self._tempo_guidance_loss(decoded_motion, motion_len_mask, tempo_target)
+            total_loss = total_loss + tempo_guidance_scale * tempo_loss
+            loss_dict["tempo"] = tempo_loss.detach()
 
         if not total_loss.requires_grad:
             return torch.zeros_like(z), loss_dict
@@ -1052,6 +1101,20 @@ class Text2StylizedMotion(nn.Module):
         if not losses:
             return torch.zeros((), device=pred.device, dtype=pred.dtype)
         return torch.stack(losses).mean()
+
+    def _tempo_guidance_loss(self, decoded_motion, motion_len_mask, tempo_target):
+        # See memory: style-salad-tempo-not-transferred. HyperLoRA has no
+        # architectural pathway for style to vary generation over time (one
+        # static LoRA pair per sample, applied uniformly to every frame), so
+        # style guidance alone can't fix tempo. This is a first, inference-
+        # only attempt at a workaround: an explicit gradient-guidance term
+        # (same DDIM x0_hat mechanism as trajectory/keyframe guidance) that
+        # nudges the sampling trajectory toward matching the reference
+        # clip's own measured speed, rather than relying on the style vector
+        # to carry that signal through HyperLoRA.
+        motion_real = self._denormalize_motion(decoded_motion)
+        speed = self._mean_joint_speed(motion_real, motion_len_mask)
+        return F.mse_loss(speed, tempo_target, reduction="mean")
 
     def _keyframe_guidance_loss(self, decoded_motion, lengths, keyframe_cfg, eps=1e-6):
         mode = keyframe_cfg.get("mode", "motion")
